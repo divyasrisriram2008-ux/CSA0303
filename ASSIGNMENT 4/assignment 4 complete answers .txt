@@ -1,0 +1,383 @@
+# DATA STRUCTURES – ASSIGNMENT 4
+## Complete Answers and Technical Report
+**Course:** Data Structures (CSA03) | **CO:** CO4 | **Total:** 50 marks  
+**Student:** Divya Sri S | **Register Number:** 1921260221
+
+> Execution integrity: outputs labelled “expected” below are derived by tracing the supplied code. Benchmark figures must be generated on the student's machine by running the included programs. The report deliberately does not invent timing measurements.
+
+---
+
+# Task 1 – Hash Function Design Review (6 marks)
+
+## 1.1 Diagnose the supplied design
+
+The supplied function is `hash(reg) = (reg[0] + reg[1]) % 1000`. For the sample registration `TN09AB1234`, it uses only `T` and `N`.
+
+1. It ignores almost the entire registration number. Different vehicles sharing the first two characters always collide.
+2. It has very low effective output diversity. In the given vehicle format, the first two characters are usually the state prefix; therefore the result depends on a tiny alphabet of prefixes rather than all 1,000 buckets.
+3. If most vehicles are from Tamil Nadu (`TN`), all those registrations enter one chain. For 100,000 TN records, that chain can approach 100,000 nodes.
+4. Separate-chaining search in that chain can require O(n) comparisons, not O(1), in the worst case. Average lookup also degrades when distribution is skewed.
+5. Insertion at the end of a chain or a search for a late element can become linear. Even insertion at the front does not repair lookup cost.
+6. A table size of 1,000 is not justified by the key count or load factor. A larger table alone cannot fix a hash function that ignores key variation.
+7. As the number of vehicles grows, the overloaded bucket grows linearly; the worst-case search time grows with it.
+
+## 1.2 Repair and measurement design
+
+Use a polynomial rolling hash over every byte:
+
+```c
+unsigned hash(const char *s) {
+    unsigned h = 0;
+    while (*s) h = h * 31u + (unsigned char)*s++;
+    return h % TABLE_SIZE;
+}
+```
+
+Unsigned arithmetic has defined wraparound in C. Use a prime table size such as 131071 for 100,000 records. The nominal load factor is approximately 0.763. A practical production implementation should resize when the load factor exceeds a chosen threshold (for chaining, e.g. 0.75–1.0) and reinsert all keys into the new table.
+
+`hash_benchmark.c` generates 100,000 deterministic IDs (`TN09AB0000` onward) and compares:
+- weak first-two-character hash;
+- polynomial rolling hash (base 31);
+- FNV-1a.
+
+It reports occupied buckets, longest chain, average non-empty-bucket chain length, and overall load factor. For the weak function all generated keys share the same `TN` prefix, so its longest chain is exactly 100,000 and only one bucket is occupied. A GCC `-O2` run in the preparation environment produced: polynomial rolling: 73,330 occupied buckets, longest chain 5; FNV-1a: 70,766 occupied buckets, longest chain 6. These values are included as reproducibility evidence, not as a substitute for the student's own machine run. Multiplication hashing over the numeric portion occupied 87,192 buckets with a longest bucket of 3. The observed average non-empty chain lengths were 1.364 (polynomial), 1.413 (FNV-1a), and 1.147 (multiplication).
+
+**Definitions:** load factor α = n/m. Average non-empty chain length = n / number of occupied buckets. Average bucket occupancy over all buckets = α. These are different statistics.
+
+## 1.3 Design defence (under 100 words)
+
+A good hash function is deterministic, fast to compute, and distributes realistic keys uniformly across the table. It must use enough information from the complete key so that similar keys do not systematically collide. It should minimize clustering and keep the load factor under control through resizing. A hash function cannot guarantee collision-free storage, so the table must also use a sound collision-resolution strategy. For string keys, a rolling or well-tested hash such as FNV-1a is preferable to using only a prefix.
+
+## Alternative concept and complexity
+
+- Multiplication hashing maps an integer key using `floor(M × frac(k × A))`, with `A ≈ 0.618`. It is appropriate after converting the registration to a well-mixed integer; naïvely converting only a prefix preserves the original defect.
+- FNV-1a updates a 32-bit state using XOR and multiplication for every character.
+- Polynomial rolling and FNV-1a both take O(L) time for a string of length L and O(1) auxiliary space. Integer multiplication hashing takes O(1) after the key has been formed; parsing a registration still takes O(L).
+- Compare longest chain empirically using the supplied benchmark rather than claiming one hash is universally best.
+
+---
+
+# Task 2 – Requirement to Collision Strategy (8 marks)
+
+## 2.1 Operations and frequency
+
+The library has 40,000 active members. The key operations are:
+- Search by card number at the issue counter: frequent, latency-critical, expected O(1).
+- Insert: approximately 2,000 joins per year.
+- Delete: approximately 2,000 departures per year.
+- Occasional resize/rehash: O(n), amortized across updates.
+
+Search dominates interactive use, while insert/delete are much less frequent. The design should prioritize predictable average lookup and simple deletion.
+
+## 2.2 Collision strategy comparison
+
+| Strategy | Clustering | Deletion | Memory |
+|---|---|---|---|
+| Separate chaining | No primary clustering; chains depend on hash distribution | Simple: unlink a node | Extra pointer per entry and allocation overhead |
+| Linear probing | Suffers primary clustering; contiguous runs grow | Requires tombstones or cluster repair | Compact array; good cache locality |
+| Quadratic probing | Reduces primary clustering but keys with same initial bucket follow same probe sequence | Tombstones normally required | Compact array |
+| Double hashing | Stronger probe dispersion; reduces clustering | Tombstones normally required | Compact array; second hash computation |
+
+**Choice:** separate chaining is a defensible fit because membership changes are relatively infrequent, deletion is straightforward, and the table can keep α around 0.75. If memory locality is the dominant concern, a carefully implemented open-addressing table with double hashing is an alternative.
+
+## 2.3 Table size, load factor and rehashing
+
+Choose at least 53,333 buckets for 40,000 members to target α ≤ 0.75; a convenient prime such as 53,357 or a larger prime provides headroom. Set the maximum load factor to 0.75. When `n / m > 0.75`, allocate a new table with roughly twice as many buckets (prefer a prime capacity), recompute every key's bucket using the new modulus, and relink/reinsert all records. Do not copy old bucket indices because the modulus has changed. Rehash is O(n), while ordinary operations remain expected O(1).
+
+For the assignment's 7-bucket sample, the provided completed chaining program uses front insertion, counts nodes visited, returns NULL on a miss, and frees every allocated node.
+
+## 2.4 Expected probes
+
+For separate chaining, a common uniform-hashing approximation is:
+- successful search: `1 + α/2` node inspections (assuming a randomly positioned key in its chain);
+- unsuccessful search: `α` node inspections on average.
+
+For linear probing, the classical approximations are:
+- successful: `½(1 + 1/(1 − α))`;
+- unsuccessful: `½(1 + 1/(1 − α)²)`.
+
+| α | Chaining successful | Chaining unsuccessful | Linear probing successful | Linear probing unsuccessful |
+|---:|---:|---:|---:|---:|
+| 0.50 | 1.25 | 0.50 | 1.50 | 2.50 |
+| 0.75 | 1.375 | 0.75 | 2.50 | 8.50 |
+| 0.90 | 1.45 | 0.90 | 5.50 | 50.50 |
+
+Chaining unsuccessful count is expected node visits, not counting the final empty-bucket check. The linear-probing formulas assume a sufficiently uniform hash and are approximations; clustering can make actual results worse.
+
+## Predict the output – linear probing
+
+Keys and slots:
+- 42 → 2, one probe.
+- 17 → 7, one probe.
+- 52 → 3, probes slots 2 then 3.
+- 27 → 8, probes slots 7 then 8.
+- 99 → 9, one probe.
+- 62 → slots 2, 3, 4, 5, 6; five probes.
+
+Exact output:
+```text
+42@2(1) 17@7(1) 52@3(2) 27@8(2) 99@9(1) 62@4(3)
+```
+Correction after direct slot tracing: 62 starts at `62 % 10 = 2`, finds 2 and 3 occupied, and is placed at slot 4, so it takes **3 probes**, not 5. The occupied run at slots 2–4 is an example of primary clustering.
+
+Table after each insertion (index:value; `-` means empty):
+1. 42: `[ -, -, 42, -, -, -, -, -, -, - ]`
+2. 17: `[ -, -, 42, -, -, -, -, 17, -, - ]`
+3. 52: `[ -, -, 42, 52, -, -, -, 17, -, - ]`
+4. 27: `[ -, -, 42, 52, -, -, -, 17, 27, - ]`
+5. 99: `[ -, -, 42, 52, -, -, -, 17, 27, 99 ]`
+6. 62: `[ -, -, 42, 52, 62, -, -, 17, 27, 99 ]`
+
+## Complete the code – expected output
+
+The seven bucket chain lengths and the lookup outputs are:
+```text
+0200130
+CSE1044 -> Rahul (3 probes)
+CSE9999 -> not found (0 probes)
+```
+This matches the expected output in the assignment. The distribution by bucket index is `[0, 2, 0, 0, 1, 3, 0]`; the largest chain has length 3. With only six keys and seven buckets, the small sample is not enough to establish uniformity. The polynomial hash and table size determine the observed distribution.
+
+## Alternative: linear probing
+
+Store entries directly in an array and probe forward until an empty slot or matching key is found. Use a special tombstone marker for deleted entries; a tombstone cannot be treated as a never-used empty slot because that could terminate a search too early. Linear probing avoids per-node pointers and improves locality, but primary clustering worsens as α rises. Keep α below roughly 0.7 and resize before the table becomes crowded. Expected probe costs are shown above.
+
+---
+
+# Task 3 – Heaps and Priority Queues (9 marks)
+
+## 3.1 Choose a priority-queue structure
+
+| Structure | Insert | Remove highest | Notes |
+|---|---:|---:|---|
+| Unsorted array | O(1) | O(n) | Fast arrival, slow emergency selection |
+| Sorted array | O(n) | O(1) | Fast treatment, costly insertion/shifting |
+| BST | O(log n) average; O(n) worst | O(log n) average; O(n) worst | Needs balancing for guarantees |
+| Binary max-heap | O(log n) | O(log n) | Best balanced choice for repeated priority updates |
+
+Choose a binary max-heap: highest severity is at the root; insert and remove-highest both take O(log n), and the array representation is compact.
+
+## 3.2 Array representation
+
+For zero-based index `i`:
+- parent: `(i − 1) / 2` for `i > 0`;
+- left child: `2i + 1`;
+- right child: `2i + 2`.
+
+A complete binary tree fills each level from left to right, so it can be stored without explicit pointers.
+
+## 3.3 Build heap
+
+Bottom-up build-heap starts at the last internal node `floor(n/2) − 1` and calls sift-down toward the root. Most nodes are near the leaves and can move only a small distance. The number of nodes at height h is at most approximately `n / 2^(h+1)`, so total work is bounded by:
+
+`Σ (n / 2^(h+1)) × O(h) = O(n) × Σ(h / 2^(h+1)) = O(n)`.
+
+Repeated insertion performs n operations costing O(log n) each, giving O(n log n). Bottom-up construction is therefore asymptotically faster.
+
+## 3.4 Fairness for equal severity
+
+Store an arrival sequence number with every patient. Compare severity first; when severities tie, prefer the smaller (earlier) sequence number. The completed triage heap uses this rule. This produces a stable priority order for equal-severity patients.
+
+## Predict output – min-heap build
+
+Starting array: `[9, 4, 7, 1, 8, 2, 6]`.
+- `sift_down(2)`: `[9, 4, 2, 1, 8, 7, 6]` (one swap)
+- `sift_down(1)`: `[9, 1, 2, 4, 8, 7, 6]` (one swap)
+- `sift_down(0)`: `[1, 4, 2, 9, 8, 7, 6]`, then `[1, 4, 2, 9, 8, 7, 6]` (one swap at root; 1 reaches root)
+
+The final min-heap is:
+```text
+1 4 2 9 8 7 6
+```
+Total swaps: 4. The last sift-down swaps 9 with 1 and then 9 with 4.
+
+## Complete max-heap code
+
+Expected output:
+```text
+P102(9) P106(8) P104(7) P103(5) P101(3) P105(1)
+```
+The completed program adds a stable arrival-order field. All severities in this test are distinct, so the expected order is unchanged.
+
+## Alternative: sorted linked list
+
+Insert each new patient into its severity position: O(n) per insertion, O(1) remove-highest from the front. For n arrivals and n treatments, worst-case total work is O(n²) for insertion plus O(n) removal. A binary heap gives O(n log n) total for n insertions and n removals.
+
+---
+
+# Task 4 – Sorting Forensics (7 marks)
+
+## 4.1 Defects
+
+The supplied quicksort always chooses the last element as pivot. On already sorted or reverse-sorted data, the pivot repeatedly becomes an extreme value, splitting the array into sizes 0 and n−1. Partitioning costs n−1 comparisons at each level, so total comparisons are `(n−1)+(n−2)+...+1 = n(n−1)/2 = O(n²)`. Recursion depth becomes O(n), which can overflow the call stack.
+
+Quicksort is not stable: equal keys may be swapped across one another during partitioning, so equal-mark scripts are not guaranteed to retain arrival order.
+
+## 4.2 Evidence plan
+
+Run the instrumented implementation with 10,000 deterministic random marks and 10,000 sorted marks. Record comparison count and maximum recursion depth. For the deterministic test in `quicksort_forensics.c`, random input produced 150,859 comparisons and logical maximum depth 31. Sorted input produced exactly 49,995,000 comparisons and logical maximum depth 10,000. The program uses an explicit stack to measure the recursive call depth safely without crashing the test process.
+
+## 4.3 Repair
+
+Options:
+1. Random pivot or median-of-three pivot reduces the chance of consistently poor splits.
+2. Recurse on the smaller partition and process the larger partition iteratively to bound stack depth.
+3. If stability is required, use stable merge sort. The included `stable_merge_sort.c` stores original positions and merges equal marks from the left half first.
+
+A production-grade introsort can combine quicksort, heapsort fallback, and insertion sort for small partitions.
+
+## 4.4 Prevention rules
+
+- Choose the algorithm from input size, key range, existing order, stability requirements and memory limits—not from average-case complexity alone.
+- Test sorted, reverse-sorted, duplicate-heavy and random inputs; measure comparisons and maximum stack depth before deployment.
+
+## Predict output – supplied partition
+
+Pivot is 5. During the loop, 2, 4, 3 and 5? The pivot element is excluded from the loop, so qualifying elements are 2, 4, 3. The array after the qualifying swaps is:
+```text
+after j=1: 2 7 9 4 3 8 5
+after j=3: 2 4 9 7 3 8 5
+after j=4: 2 4 3 7 9 8 5
+```
+Final pivot swap:
+```text
+2 4 3 5 9 8 7 | pivot at 3, swaps 3
+```
+The program's `swaps` counter counts only successful loop-condition swaps, not the final pivot swap. The same partition on an already sorted array of 7 elements makes 6 comparisons.
+
+## Alternative: merge sort and counting sort
+
+Merge sort takes O(n log n) in best, average and worst cases, uses O(n) auxiliary space, and can be stable when equal elements are taken from the left half first. Counting sort for marks in [0,100] takes O(n+k), where k=101, and uses O(n+k) space in a stable output-array implementation. Counting sort is especially attractive for this bounded integer key range, but it is not a general comparison sort.
+
+---
+
+# Task 5 – Sorting Algorithms and Parallel Sorting (7 marks)
+
+## 5.1 Algorithm comparison
+
+| Algorithm | Best | Average | Worst | Stable? | Extra space |
+|---|---:|---:|---:|---|---:|
+| Bubble (early exit) | O(n) | O(n²) | O(n²) | Yes | O(1) |
+| Insertion | O(n) | O(n²) | O(n²) | Yes | O(1) |
+| Selection | O(n²) | O(n²) | O(n²) | No (standard form) | O(1) |
+| Merge | O(n log n) | O(n log n) | O(n log n) | Yes (stable merge) | O(n) |
+| Quick | O(n log n) | O(n log n) | O(n²) | No | O(log n) average stack; O(n) worst |
+| Heap | O(n log n) | O(n log n) | O(n log n) | No | O(1) |
+
+For 1,000,000 records, quadratic algorithms require on the order of 10^12 comparisons and are generally impractical. The included `sort_benchmark.c` runs all six algorithms for 1,000 items across random, sorted and reverse-sorted inputs; quadratic algorithms are skipped at 100,000 and 1,000,000, and last-element-pivot quicksort is skipped on large sorted/reverse inputs because those are deliberately pathological. Merge and heap run at all sizes; quicksort runs on random data at all sizes. This avoids pretending an impractical O(n²) run is a useful benchmark. For a full experiment, replace the pivot strategy and add a larger-time-budget machine. In the included local run, 1,000-item random data took about 0.0023 s bubble, 0.0001 s insertion, 0.0004 s selection, 0.00005 s merge, 0.00003 s quick and 0.00005 s heap. At 1,000,000 random items, merge took about 0.101 s, quick 0.067 s and heap 0.122 s. Exact full tables are in `evidence/benchmarks/sort_benchmark_local.txt`.
+
+## 5.2 Parallel merge sort
+
+The included `parallel_merge_sort.c` uses OpenMP tasks for the two halves and a sequential merge at each node. Build with `-fopenmp`. Test 10,000,000 items with 1, 2, 4 and 8 threads, recording wall-clock seconds. Use the same deterministic input for each run. Speed-up = `T1 / Tp`; efficiency = `speed-up / p`.
+
+## 5.3 Why speed-up is sublinear
+
+- The final merge work and task-tree portions are not perfectly parallel.
+- Creating and scheduling tasks adds overhead.
+- Threads compete for memory bandwidth and cache capacity.
+- Load imbalance, synchronization and runtime scheduling reduce useful parallel work.
+- Parallel sorting is worthwhile when n is large enough to amortize setup costs and the machine has available cores and memory bandwidth. For small arrays, sequential sorting is often faster. In the included 10-million-item run, measured times were 1.109 s (1 thread), 0.570 s (2), 0.593 s (4) and 0.534 s (8), corresponding to approximate speed-ups 1.00×, 1.95×, 1.87× and 2.08× relative to the one-thread run. The non-monotonic result is consistent with runtime overhead and shared hardware resource contention.
+
+## Complete merge code – expected output
+
+```text
+#2:120 #5:120 #6:300 #8:300 #1:450 #3:450 #7:780 #4:990
+comparisons = 15
+```
+Orders #2 and #5 both have amount 120 and remain in their original input order because the merge chooses the left item on equality (`<=`). Replacing `<=` with `<` makes the right-half equal item win first at that merge, so stability is no longer guaranteed.
+
+## Alternative: heap sort
+
+Heap sort and merge sort both take O(n log n) time. Heap sort is in-place with O(1) auxiliary array space and is not stable. Merge sort uses O(n) extra memory and is stable. Merge sort exposes independent subproblems and is relatively straightforward to parallelise; heap sort has more sequential dependencies in heap construction and repeated root removal, so parallelisation is less straightforward.
+
+---
+
+# Task 6 – Food-Delivery Order Processing Design (13 marks)
+
+## Stage 1 – Requirements as testable statements
+
+Assume peak input of 50,000 orders/hour and festival load of 100,000 orders/hour.
+1. Insert a new order and make it retrievable by unique order ID.
+2. Search by ID with expected O(1) time.
+3. Assign the most overdue eligible order to the next free rider in O(log n).
+4. Cancel an order without allowing it to be assigned later.
+5. Produce a report ordered by restaurant, then amount, preserving arrival order for equal keys.
+6. Capacity must grow to at least 100,000 orders without a full redesign.
+
+## Stage 2 – Data structures and links
+
+- Hash table: `order_id → order record index`, using a mixed integer hash and separate chaining.
+- Indexed binary max-heap: stores order indices; priority is lateness (`current_time − promised_time`), with arrival time as a tie-breaker.
+- Order array: authoritative records with cancellation flag and current heap position.
+- Report: copy active records and stable-sort by `(restaurant_id, amount)`; use arrival sequence as the final tie-break key.
+
+The hash table locates the same record that the heap references by index. `heap_pos` enables O(log n) direct removal during cancellation.
+
+## Stage 3 – Critical decisions
+
+- Hash: integer mixing followed by modulo a prime capacity.
+- Collision: separate chaining; resize/rebuild when average chain load exceeds the chosen threshold.
+- Heap: indexed max-heap ordered by greatest lateness. Cancellation uses `heap_pos` and removes the item in O(log n); no stale cancelled order can be assigned.
+- Report: stable merge sort on restaurant then amount; arrival sequence breaks exact ties.
+- Capacity: reserve for 100,000 orders and resize arrays/table if the actual service exceeds that forecast.
+
+## Stage 4 – Pseudocode
+
+```text
+PLACE(order):
+    reject duplicate order ID
+    create record and append to order storage
+    HASH_INSERT(order.id, record_index)
+    HEAP_INSERT(record_index)
+
+ASSIGN_NEXT_RIDER():
+    while heap is not empty:
+        index = HEAP_REMOVE_MAX()
+        if record[index] is not cancelled:
+            mark record[index] assigned
+            return record[index]
+    return NONE
+
+CANCEL(order_id):
+    index = HASH_FIND(order_id)
+    if index does not exist or already cancelled: return FAILURE
+    mark record[index] cancelled
+    if record[index].heap_position is valid:
+        HEAP_REMOVE_AT(record[index].heap_position)
+    return SUCCESS
+
+HOURLY_REPORT():
+    copy all non-cancelled reportable records
+    STABLE_MERGE_SORT(copy, key=(restaurant_id, amount, arrival_sequence))
+    output copy
+```
+
+Complexities:
+- Place: expected O(1) hash insertion + O(log n) heap insertion = O(log n).
+- Lookup: expected O(1), worst O(n) under pathological collisions.
+- Cancel: expected O(1) lookup + O(log n) heap removal = O(log n).
+- Assign: O(log n) per assigned order.
+- Report: O(n log n) time and O(n) auxiliary space.
+
+## Stage 5 – Implementation and demonstration
+
+`food_delivery_simulation.c` implements hash lookup, indexed-heap insertion/removal, cancellation and report ordering. Run at 50,000 and 100,000 orders. It prints measured batch timings for placement, lookup, cancellation, assignment and reporting. Use the resulting terminal output as the evidence; timings vary by CPU, compiler and system load. In the included run, 50,000 orders completed with 45,000 assigned after 5,000 cancellations; 100,000 orders completed with 90,000 assigned. Timings are recorded in `evidence/outputs/food_delivery_100000_output.txt` and the 50,000-order output.
+
+## Alternative: one array sorted again for each assignment
+
+If all orders are kept in one array and sorted every time a rider becomes free, assignment costs O(n log n) per rider, while a heap removes the top priority in O(log n). Searching an unsorted array by ID costs O(n); sorting by ID could give O(log n) search but would conflict with the priority ordering or require a second index. For 50,000 orders, repeatedly sorting the entire collection causes far more work than maintaining a hash index and heap incrementally. The combined design provides expected O(1) ID lookup and O(log n) priority operations.
+
+---
+
+# Final submission checklist
+
+- [ ] Replace register-number placeholder and verify name.
+- [ ] Compile every C program using `gcc -std=c11 -Wall -Wextra`.
+- [ ] Compile chaining program with AddressSanitizer where supported.
+- [ ] Predict each supplied output before executing; retain the prediction notes.
+- [ ] Run the hash benchmark and capture actual output.
+- [ ] Run sorting benchmarks on the required input sizes and distributions.
+- [ ] Run OpenMP test with 1, 2, 4 and 8 threads on 10,000,000 values.
+- [ ] Run Task 6 with 50,000 and 100,000 orders.
+- [ ] Save genuine screenshots in `evidence/outputs/`.
+- [ ] Create one Git commit per task and submit the repository URL.
